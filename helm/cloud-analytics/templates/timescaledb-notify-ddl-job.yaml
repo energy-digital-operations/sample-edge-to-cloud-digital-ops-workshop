@@ -49,20 +49,32 @@ spec:
               until psql "$TIMESCALE_DSN" -c 'SELECT 1' >/dev/null 2>&1; do
                 sleep 3
               done
-              echo "Re-applying sensor_readings_notify function + trigger (statement-level, #210)..."
+              echo "Re-applying dashboard push path: ~1s notify tick, commit-decoupled (#272)..."
               psql "$TIMESCALE_DSN" <<'SQL'
-              CREATE OR REPLACE FUNCTION notify_sensor_reading() RETURNS trigger AS $notify$
-              BEGIN
-                PERFORM pg_notify('sensor_readings_change', 'batch');
-                RETURN NULL;
-              END;
-              $notify$ LANGUAGE plpgsql;
-
+              -- Retire the old per-insert push path if this slot still has it.
+              -- The AFTER INSERT trigger fired pg_notify() inside each writer's
+              -- COMMIT, serializing concurrent bulk-batch commits on Postgres's
+              -- async-notification AccessExclusiveLock (#272 — see the comment in
+              -- timescaledb-cluster.yaml). Move it off the commit path entirely.
               DROP TRIGGER IF EXISTS sensor_readings_notify ON sensor_readings;
+              DROP FUNCTION IF EXISTS notify_sensor_reading();
 
-              CREATE TRIGGER sensor_readings_notify
-                AFTER INSERT ON sensor_readings
-                FOR EACH STATEMENT EXECUTE FUNCTION notify_sensor_reading();
+              -- Procedure the ~1s background job runs to wake the dashboard's
+              -- LISTEN (payload is a fixed token; the listener re-aggregates).
+              CREATE OR REPLACE PROCEDURE notify_tick(job_id int, config jsonb)
+              LANGUAGE plpgsql AS $tick$
+              BEGIN
+                PERFORM pg_notify('sensor_readings_change', 'tick');
+              END;
+              $tick$;
+
+              -- Exactly one 1s tick job. add_job() has no upsert, so delete any
+              -- existing notify_tick jobs first — this keeps re-runs on every
+              -- helm upgrade idempotent (no duplicate ticks piling up).
+              SELECT delete_job(job_id)
+                FROM timescaledb_information.jobs
+                WHERE proc_name = 'notify_tick';
+              SELECT add_job('notify_tick', schedule_interval => INTERVAL '1 second');
               SQL
               echo "DDL complete."
               {{- if .Values.timescaledb.caggEnabled }}
