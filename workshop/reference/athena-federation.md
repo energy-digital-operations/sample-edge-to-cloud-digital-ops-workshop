@@ -38,9 +38,11 @@ same `scripts/athena-query.sh` wrapper and console you already use for the
 Iceberg table work unchanged — you just prefix a table with its catalog.
 
 ```sql
--- Live rows from cloud TimescaleDB for one slot
+-- Live rows from cloud TimescaleDB for one slot. The connector exposes the
+-- PostgreSQL *schema* as the Athena database: sensor_readings lives in `public`
+-- (the `edge` database is already fixed by the connector's connection string).
 SELECT sensor, value, unit, partition_time
-FROM "timescaledb_cloud"."edge"."sensor_readings"
+FROM "timescaledb_cloud"."public"."sensor_readings"
 WHERE deployment_id = 'ws-slot00'
 ORDER BY partition_time DESC
 LIMIT 20;

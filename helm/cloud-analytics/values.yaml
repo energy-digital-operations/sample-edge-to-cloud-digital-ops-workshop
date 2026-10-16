@@ -180,6 +180,12 @@ timescaledb:
   # default so the committed baseline stays the raw windowed read the docs
   # describe and no slot pays the continuous-refresh cost unless it opts in.
   caggEnabled: false
+  # Data-retention window for the sensor_readings hypertable. The tsdb-notify-ddl
+  # Job installs a TimescaleDB retention policy that drops chunks older than this,
+  # so the shared cloud instance keeps ~this much history and its 50Gi volume
+  # can't fill and crashloop ("no free disk space for WALs"). TimescaleDB
+  # retention is time-based; "7 days" is the bounded-size knob.
+  retentionInterval: "7 days"
   crName: timescaledb-cloud
   imageName: ghcr.io/clevyr/cloudnativepg-timescale:16.4-ts2.16
   instances: 2

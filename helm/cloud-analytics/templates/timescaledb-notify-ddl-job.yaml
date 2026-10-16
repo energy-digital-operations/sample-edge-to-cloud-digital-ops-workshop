@@ -75,6 +75,14 @@ spec:
                 FROM timescaledb_information.jobs
                 WHERE proc_name = 'notify_tick';
               SELECT add_job('notify_tick', schedule_interval => INTERVAL '1 second');
+
+              -- Bound storage growth: keep ~1 week of raw readings. TimescaleDB
+              -- drops whole chunks older than drop_after on a background
+              -- schedule, so the sensor_readings hypertable (and its PVC) can't
+              -- grow unbounded — without this, the shared cloud instance fills
+              -- its 50Gi volume and crashloops on "no free disk space for WALs".
+              -- if_not_exists keeps re-runs on every helm upgrade idempotent.
+              SELECT add_retention_policy('sensor_readings', drop_after => INTERVAL '{{ .Values.timescaledb.retentionInterval }}', if_not_exists => TRUE);
               SQL
               echo "DDL complete."
               {{- if .Values.timescaledb.caggEnabled }}
