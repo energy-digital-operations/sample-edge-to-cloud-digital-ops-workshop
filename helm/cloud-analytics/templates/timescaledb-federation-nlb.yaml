@@ -1,0 +1,36 @@
+{{- if and .Values.timescaledb.enabled .Values.timescaledb.federationNlb.enabled }}
+# Internal NLB exposing the TimescaleDB primary (:5432) to the workshop-cloud
+# VPC. The Athena PostgreSQL federation connector Lambda is VPC-attached but is
+# NOT on the EKS pod/service network, so it cannot reach the CNPG `-rw`
+# ClusterIP service directly — it needs a stable, VPC-routable endpoint. This
+# Service provisions an internal NLB via the in-tree EKS cloud controller (no
+# AWS Load Balancer Controller required): `aws-load-balancer-type: nlb` with
+# instance targets, `aws-load-balancer-internal` so it lives in the private
+# subnets. Its generated DNS name is wired to the stable
+# `timescaledb.workshop.internal` Route53 record by scripts/deploy-cloud-analytics.sh,
+# which is the host the connector's DefaultConnectionString points at (see
+# amplify/custom/platform-stack.ts, Athena federation block).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.timescaledb.crName }}-fed-nlb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloud-analytics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: timescaledb-federation
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  # Target the CNPG primary only — the same label pair CNPG stamps on the
+  # primary pod and uses for its own `-rw` (read-write) Service.
+  selector:
+    cnpg.io/cluster: {{ .Values.timescaledb.crName }}
+    role: primary
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+{{- end }}

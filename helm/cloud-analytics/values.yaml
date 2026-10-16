@@ -195,6 +195,15 @@ timescaledb:
     enablePodAntiAffinity: true
     topologyKey: kubernetes.io/hostname
     podAntiAffinityType: preferred
+  # Internal NLB that exposes the primary (:5432) to the workshop-cloud VPC so
+  # the Athena PostgreSQL federation connector Lambda can reach TimescaleDB (it
+  # is VPC-attached but not on the EKS pod network, so the CNPG ClusterIP is
+  # unreachable). Provisioned by the in-tree EKS LoadBalancer controller — no
+  # AWS Load Balancer Controller needed. The NLB DNS is bound to the stable
+  # timescaledb.workshop.internal Route53 record post-deploy. See
+  # templates/timescaledb-federation-nlb.yaml.
+  federationNlb:
+    enabled: true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Redpanda Connect — MSK → TimescaleDB sink pipeline

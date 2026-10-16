@@ -122,6 +122,7 @@ nav:
       - Architecture Reference: reference/architecture.md
       - Architecture Decisions: reference/decisions.md
       - Device Client vs. Greengrass: reference/device-client-vs-greengrass.md
+      - Athena Federated Query (one SQL engine, every store): reference/athena-federation.md
       - Registering a Device over SSH: reference/register-device-over-ssh.md
       - Gotchas & Watch-Outs: reference/gotchas.md
       - Repository Structure: reference/repo-structure.md
