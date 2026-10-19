@@ -479,6 +479,55 @@ kubectl create secret generic timescaledb-dashboard-env -n "$NAMESPACE" \
   --from-literal=TIMESCALEDB_ENDPOINT="$TSDB_DSN" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# ── 6b. Athena Federated Query wiring (shared only) ─────────────────────────
+# One-time, account-shared setup for the PostgreSQL federation connector
+# (platform-stack.ts "Athena Federated Query" block): a Secrets Manager secret
+# with the TimescaleDB creds the connector reads, and a stable Route53 name
+# (timescaledb.workshop.internal) bound to the internal NLB the chart just
+# provisioned — the connector's connection string points at that name. The MSK
+# (Kafka) connector reuses the AmazonMSK_workshop-shared SCRAM secret created in
+# section 3, so nothing extra is needed for it here. Skipped cleanly on a
+# platform stack that predates this feature (the zone export is absent), exactly
+# like the InfluxDB tier above.
+if [[ "$SHARED" == "true" ]]; then
+  FED_ZONE_ID=$(aws cloudformation list-exports \
+    --query "Exports[?Name=='workshop-platform-federation-zone-id'].Value" --output text 2>/dev/null || true)
+  if [[ -z "$FED_ZONE_ID" || "$FED_ZONE_ID" == "None" ]]; then
+    echo ">>> WARN: workshop-platform-federation-zone-id export not found — the platform"
+    echo "          stack predates Athena federation. Skipping connector wiring."
+  else
+    FED_TSDB_SECRET="workshop/athena-federation/timescaledb"
+    echo ">>> [federation] Upserting Secrets Manager secret ${FED_TSDB_SECRET} (TimescaleDB creds)..."
+    FED_TSDB_SECRET_JSON=$(python3 -c "import json,sys; print(json.dumps({'username': 'workshop', 'password': sys.argv[1]}))" "$TSDB_PASSWORD")
+    if aws secretsmanager describe-secret --secret-id "$FED_TSDB_SECRET" >/dev/null 2>&1; then
+      aws secretsmanager put-secret-value --secret-id "$FED_TSDB_SECRET" \
+        --secret-string "$FED_TSDB_SECRET_JSON" >/dev/null
+    else
+      aws secretsmanager create-secret --name "$FED_TSDB_SECRET" \
+        --description "Cloud TimescaleDB creds for the Athena PostgreSQL federation connector" \
+        --secret-string "$FED_TSDB_SECRET_JSON" >/dev/null
+    fi
+
+    echo ">>> [federation] Waiting for the TimescaleDB internal NLB hostname..."
+    FED_NLB_HOST=""
+    for _ in $(seq 1 60); do
+      FED_NLB_HOST=$(kubectl get svc "${TSDB_CR}-fed-nlb" -n "$NAMESPACE" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+      [[ -n "$FED_NLB_HOST" ]] && break
+      sleep 10
+    done
+    if [[ -z "$FED_NLB_HOST" ]]; then
+      echo "ERROR: ${TSDB_CR}-fed-nlb never got an NLB hostname — the Athena PostgreSQL" >&2
+      echo "       connector will not be able to resolve timescaledb.workshop.internal." >&2
+      exit 1
+    fi
+    echo ">>> [federation] Pointing timescaledb.workshop.internal → ${FED_NLB_HOST}"
+    FED_CHANGE_BATCH=$(python3 -c "import json,sys; print(json.dumps({'Changes':[{'Action':'UPSERT','ResourceRecordSet':{'Name':'timescaledb.workshop.internal','Type':'CNAME','TTL':60,'ResourceRecords':[{'Value':sys.argv[1]}]}}]}))" "$FED_NLB_HOST")
+    aws route53 change-resource-record-sets --hosted-zone-id "$FED_ZONE_ID" \
+      --change-batch "$FED_CHANGE_BATCH" >/dev/null
+  fi
+fi
+
 # ── 7. Drive readiness ourselves (replaces the `--wait` we dropped above) ────
 echo ">>> Waiting for cloud-analytics workloads to become ready..."
 kubectl rollout status -n "$NAMESPACE" deploy/cloud-analytics-dashboard --timeout=10m

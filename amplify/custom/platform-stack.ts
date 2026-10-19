@@ -10,6 +10,7 @@ import {
   CfnNatGateway,
   CfnVPCPeeringConnection,
   CfnRoute,
+  CfnSecurityGroupIngress,
 } from "aws-cdk-lib/aws-ec2";
 import {
   Role,
@@ -45,8 +46,10 @@ import {
 } from "aws-cdk-lib/custom-resources";
 import { CfnDeliveryStream } from "aws-cdk-lib/aws-kinesisfirehose";
 import { LogGroup, LogStream, RetentionDays } from "aws-cdk-lib/aws-logs";
-import { CfnDatabase, CfnTable } from "aws-cdk-lib/aws-glue";
-import { CfnWorkGroup } from "aws-cdk-lib/aws-athena";
+import { CfnDatabase, CfnTable, CfnRegistry, CfnSchema } from "aws-cdk-lib/aws-glue";
+import { CfnWorkGroup, CfnDataCatalog } from "aws-cdk-lib/aws-athena";
+import { CfnApplication } from "aws-cdk-lib/aws-sam";
+import { PrivateHostedZone } from "aws-cdk-lib/aws-route53";
 import { CfnInfluxDBInstance } from "aws-cdk-lib/aws-timestream";
 import { Secret } from "aws-cdk-lib/aws-secretsmanager";
 import { StringParameter } from "aws-cdk-lib/aws-ssm";
@@ -556,6 +559,15 @@ export class PlatformStack extends Stack {
           expiration: Duration.days(14),
         },
         {
+          // Athena federated-query connectors spill over-sized result pages
+          // here (see the Athena federation block). The connectors delete their
+          // own spill, but orphans from timed-out/failed queries would otherwise
+          // accumulate — same regenerable-scratch rationale as athena-results/.
+          id: "expire-athena-federation-spill",
+          prefix: "athena-federation-spill/",
+          expiration: Duration.days(7),
+        },
+        {
           // Abort dangling multipart uploads (a classic silent source of
           // bucket bloat that the auto-delete Lambda must also page through).
           id: "abort-incomplete-mpu",
@@ -1061,6 +1073,211 @@ export class PlatformStack extends Stack {
       exportName: "workshop-platform-athena-workgroup-name",
       value: athenaWorkGroup.name,
     });
+
+    // ── Athena Federated Query — connectors for the cloud data stores ─────────
+    // The Iceberg `workshop_telemetry.telemetry` table above is native Athena.
+    // Federation adds two more catalogs so the SAME SQL engine can also reach
+    // the live cloud stores and JOIN across all three:
+    //   * `timescaledb_cloud` → cloud TimescaleDB (PostgreSQL wire)  — the
+    //     Amazon Athena PostgreSQL connector (prebuilt, SAR, VPC-attached Lambda)
+    //   * `msk`               → the shared MSK topics raw.telemetry /
+    //     sensors.raw.sim — the Amazon Athena Kafka connector (prebuilt, SAR)
+    // RisingWave and Timestream-for-InfluxDB are intentionally out of scope.
+    //
+    // --8<-- [start:athena-federation]
+    // Both connectors run as VPC-attached Lambdas in workshop-cloud. MSK is
+    // already reachable (its SG admits the cloud VPC CIDR on 9096). TimescaleDB
+    // lives on the EKS pod network as a CNPG ClusterIP, which a VPC Lambda
+    // cannot reach — so the cloud-analytics chart exposes the primary through an
+    // internal NLB and the connector dials the stable Route53 name below (wired
+    // to the NLB's generated DNS post-deploy by scripts/deploy-cloud-analytics.sh).
+    const privateSubnetIds = this.cloudVpc.selectSubnets({
+      subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+    }).subnetIds;
+    const fedSpillPrefix = "athena-federation-spill";
+
+    // Private hosted zone giving the federation Lambdas a stable DNS name for
+    // the in-cluster TimescaleDB NLB. Associated with the cloud VPC so the
+    // VPC-attached connector Lambda resolves it.
+    const federationZone = new PrivateHostedZone(this, "FederationZone", {
+      zoneName: "workshop.internal",
+      vpc: this.cloudVpc,
+    });
+    new CfnOutput(this, "FederationZoneId", {
+      exportName: "workshop-platform-federation-zone-id",
+      value: federationZone.hostedZoneId,
+    });
+
+    // Dedicated SG for the federation connector Lambdas.
+    const athenaFedSg = new SecurityGroup(this, "AthenaFedSg", {
+      vpc: this.cloudVpc,
+      description: "Athena federation connector Lambdas",
+      allowAllOutbound: true,
+    });
+    new CfnOutput(this, "AthenaFedSgId", {
+      exportName: "workshop-platform-athena-fed-sg-id",
+      value: athenaFedSg.securityGroupId,
+    });
+
+    // Open the TimescaleDB internal NLB path. The in-tree EKS NLB uses INSTANCE
+    // targets, so both client traffic (source IP preserved by NLB) and NLB
+    // health checks arrive at the worker nodes' nodePort from within the cloud
+    // VPC. Managed-nodegroup nodes attach the EKS cluster security group, so
+    // admit the nodePort range on it from the cloud VPC CIDR (covers the Lambda
+    // ENIs and the NLB health checkers, both in-VPC).
+    new CfnSecurityGroupIngress(this, "EksNodePortFromCloudVpc", {
+      groupId: eksCluster.attrClusterSecurityGroupId,
+      ipProtocol: "tcp",
+      fromPort: 30000,
+      toPort: 32767,
+      cidrIp: this.cloudVpc.vpcCidrBlock,
+      description: "Athena federation to TimescaleDB internal NLB node ports",
+    });
+
+    // Credentials. The PostgreSQL connector reads a {username,password} secret
+    // referenced by `${name}` in its connection string; it is populated
+    // post-deploy from the CNPG app secret (scripts/deploy-cloud-analytics.sh),
+    // under a prefix the connector's SAR template scopes GetSecretValue to.
+    // Default (AWS-managed) Secrets Manager encryption so the connector needs no
+    // KMS grant (same rationale as the InfluxDB admin secret). The Kafka
+    // connector reuses the shared `AmazonMSK_workshop-shared` SCRAM secret the
+    // deploy script already creates+associates with the cluster (its own SAR
+    // role carries kms:Decrypt for that CMK-encrypted secret).
+    const fedSecretPrefix = "workshop/athena-federation";
+    const tsFedSecretName = `${fedSecretPrefix}/timescaledb`;
+    const mskFedSecretName = "AmazonMSK_workshop-shared";
+    new CfnOutput(this, "AthenaFedTimescaledbSecretName", {
+      exportName: "workshop-platform-athena-fed-timescaledb-secret-name",
+      value: tsFedSecretName,
+    });
+
+    // ---- PostgreSQL connector → cloud TimescaleDB ----
+    // CompositeHandler=PostGreSqlCompositeHandler → single-instance mode: the
+    // Lambda always uses the `default` connection string. The `${secret}` token
+    // is replaced at query time by user=/password= pulled from Secrets Manager.
+    // sslmode=require encrypts without cert verification (CNPG serves a
+    // self-signed cert) — pgjdbc's `require` does not validate the chain.
+    const pgFnName = "workshop-athena-fed-timescaledb";
+    const tsConnStr =
+      "postgres://jdbc:postgresql://timescaledb.workshop.internal:5432/edge?${" +
+      tsFedSecretName +
+      "}&sslmode=require";
+    const pgConnector = new CfnApplication(this, "TimescaleDbConnector", {
+      location: {
+        // Literal ARN: the SAM transform only accepts a plain string / Ref /
+        // FindInMap for a Serverless::Application ApplicationId — an Fn::Join
+        // (which `arn:${this.partition}:...` would synthesize to) is rejected.
+        applicationId: "arn:aws:serverlessrepo:us-east-1:292517598671:applications/AthenaPostgreSQLConnector",
+        semanticVersion: "2026.38.1",
+      },
+      parameters: {
+        LambdaFunctionName: pgFnName,
+        CompositeHandler: "PostGreSqlCompositeHandler",
+        SecretNamePrefix: fedSecretPrefix,
+        DefaultConnectionString: tsConnStr,
+        SpillBucket: workshopBucket.bucketName,
+        SpillPrefix: fedSpillPrefix,
+        SecurityGroupIds: athenaFedSg.securityGroupId,
+        SubnetIds: Fn.join(",", privateSubnetIds),
+      },
+    });
+
+    // ---- Kafka connector → shared MSK topics ----
+    const kafkaFnName = "workshop-athena-fed-msk";
+    const kafkaConnector = new CfnApplication(this, "MskConnector", {
+      location: {
+        // Literal ARN (see the PostgreSQL connector above re: the SAM transform).
+        applicationId: "arn:aws:serverlessrepo:us-east-1:292517598671:applications/AthenaKafkaConnector",
+        semanticVersion: "2025.14.4",
+      },
+      parameters: {
+        LambdaFunctionName: kafkaFnName,
+        AuthType: "SASL_SSL_SCRAM_SHA512",
+        // SASL/SCRAM bootstrap brokers (port 9096) — same lookup the
+        // MskBootstrapScram export uses.
+        KafkaEndpoint: mskBootstrapLookup.getResponseField("BootstrapBrokerStringSaslScram"),
+        SecretNamePrefix: mskFedSecretName,
+        SpillBucket: workshopBucket.bucketName,
+        SpillPrefix: fedSpillPrefix,
+        SecurityGroupIds: athenaFedSg.securityGroupId,
+        SubnetIds: Fn.join(",", privateSubnetIds),
+      },
+    });
+
+    // Glue Schema Registry drives how the Kafka connector maps JSON topics to
+    // Athena tables: the registry name is the Athena *database* and each schema
+    // is a *table*. The connector only discovers registries whose description
+    // carries the `{AthenaFederationKafka}` marker. Field types mirror the
+    // RisingWave cloud SOURCE definitions in risingwave/ddl-cloud.sql.
+    const kafkaRegistry = new CfnRegistry(this, "MskSchemaRegistry", {
+      name: "athena_msk",
+      description: "{AthenaFederationKafka} MSK topic schemas for Athena federation",
+    });
+    const kafkaSchema = (
+      id: string,
+      schemaName: string,
+      topicName: string,
+      fields: ReadonlyArray<[string, string]>,
+    ) =>
+      new CfnSchema(this, id, {
+        registry: { arn: kafkaRegistry.attrArn },
+        name: schemaName,
+        dataFormat: "JSON",
+        compatibility: "NONE",
+        schemaDefinition: JSON.stringify({
+          topicName,
+          message: {
+            dataFormat: "json",
+            fields: fields.map(([name, type]) => ({ name, mapping: name, type })),
+          },
+        }),
+      });
+    // raw.telemetry — flat IoT node telemetry (IotToMskRule enriches with
+    // deployment_id, mqtt_topic, ingest_ts).
+    kafkaSchema("MskSchemaRawTelemetry", "raw_telemetry", "raw.telemetry", [
+      ["thing_name", "VARCHAR"],
+      ["deployment_id", "VARCHAR"],
+      ["cpu_pct", "DOUBLE"],
+      ["mem_used_pct", "DOUBLE"],
+      ["disk_used_pct", "DOUBLE"],
+      ["net_io_bytes_sent", "BIGINT"],
+      ["net_io_bytes_recv", "BIGINT"],
+      ["message_timestamp", "BIGINT"],
+      ["ingest_ts", "BIGINT"],
+      ["mqtt_topic", "VARCHAR"],
+    ]);
+    // sensors.raw.sim — simulated industrial sensor telemetry (deployment_id is
+    // NOT a payload field; it is derived downstream from site_id).
+    kafkaSchema("MskSchemaSensorsRawSim", "sensors_raw_sim", "sensors.raw.sim", [
+      ["sensor", "VARCHAR"],
+      ["site_id", "VARCHAR"],
+      ["value", "DOUBLE"],
+      ["unit", "VARCHAR"],
+      ["ts_ms", "BIGINT"],
+    ]);
+
+    // Register each connector Lambda as an Athena data catalog. The Lambda names
+    // are fixed above, so the function ARN is deterministic (no cross-stack
+    // GetAtt from the SAR nested stack needed).
+    const pgCatalog = new CfnDataCatalog(this, "TimescaleDbCatalog", {
+      name: "timescaledb_cloud",
+      type: "LAMBDA",
+      description: "Cloud TimescaleDB (PostgreSQL federation connector)",
+      parameters: {
+        function: `arn:${this.partition}:lambda:${this.region}:${this.account}:function:${pgFnName}`,
+      },
+    });
+    pgCatalog.node.addDependency(pgConnector);
+    const mskCatalog = new CfnDataCatalog(this, "MskCatalog", {
+      name: "msk",
+      type: "LAMBDA",
+      description: "Shared MSK topics (Kafka federation connector)",
+      parameters: {
+        function: `arn:${this.partition}:lambda:${this.region}:${this.account}:function:${kafkaFnName}`,
+      },
+    });
+    mskCatalog.node.addDependency(kafkaConnector);
+    // --8<-- [end:athena-federation]
 
     // ── IoT Jobs → reserved $package shadow auto-update ──────────────────────
     // Role IoT Jobs assumes to write the reserved named shadow ($package) when a

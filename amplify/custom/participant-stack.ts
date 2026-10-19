@@ -1744,6 +1744,38 @@ exports.handler = async (event) => {
       ],
     }));
 
+    // Athena Federated Query — let participants query the two federated
+    // catalogs the platform registers (`timescaledb_cloud`, `msk`) through the
+    // same shared workgroup. Running a federated query needs GetDataCatalog on
+    // the catalog plus permission to invoke its connector Lambda; the connector
+    // itself reads the data source + Glue Schema Registry with its OWN role, so
+    // participants need no Glue-registry or TimescaleDB/MSK grants here. (The
+    // Iceberg `telemetry` table above is native Athena and needs none of this.)
+    participantRole.addToPolicy(new PolicyStatement({
+      effect: Effect.ALLOW,
+      actions: ["athena:GetDataCatalog"],
+      resources: [
+        `arn:aws:athena:${this.region}:${this.account}:datacatalog/timescaledb_cloud`,
+        `arn:aws:athena:${this.region}:${this.account}:datacatalog/msk`,
+      ],
+    }));
+    participantRole.addToPolicy(new PolicyStatement({
+      effect: Effect.ALLOW,
+      actions: ["lambda:InvokeFunction"],
+      resources: [
+        `arn:aws:lambda:${this.region}:${this.account}:function:workshop-athena-fed-timescaledb`,
+        `arn:aws:lambda:${this.region}:${this.account}:function:workshop-athena-fed-msk`,
+      ],
+    }));
+    // Federated-query results that overflow Lambda memory spill to S3; Athena
+    // reads that spill back on the submitter's behalf, so grant read on the
+    // dedicated spill prefix (same shared bucket as athena-results/).
+    participantRole.addToPolicy(new PolicyStatement({
+      effect: Effect.ALLOW,
+      actions: ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      resources: [sharedBucketArn, `${sharedBucketArn}/athena-federation-spill/*`],
+    }));
+
     // EC2 — describe-only calls have no resource-level permissions support
     // (05-edge-infra/block-2, block-3).
     participantRole.addToPolicy(new PolicyStatement({
